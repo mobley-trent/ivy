@@ -1,7 +1,18 @@
-import ivy
+import array
+import struct
 import numpy as np
+import ivy
 import scipy
 import ivy.functional.frontends.numpy as ivy_np
+
+from typing import Iterable, Tuple, cast
+
+try:
+    import scipy.sparse
+
+    _have_scipy = True
+except:
+    _have_scipy = False
 
 
 class Vector:
@@ -48,7 +59,7 @@ class DenseVector(Vector):
         return ivy_np.linalg.norm(self.array, p)
 
     def dot(self, other):
-        if type(other) == np.ndarray:
+        if type(other) == ivy.Array:
             if other.ndim > 1:
                 assert len(self) == other.shape[0], "dimension mismatch"
             return ivy.dot(self.array, other)
@@ -82,4 +93,210 @@ class DenseVector(Vector):
         return self.array
 
     def asML(self):
-        return NotImplementedError
+        return DenseVector(self.array)
+
+    @property
+    def values(self):
+        return self.array
+
+    def __getitem__(self, item):
+        return self.array[item]
+
+    def __len__(self):
+        return len(self.array)
+
+    def __str__(self):
+        return "[" + ",".join([str(v) for v in self.array]) + "]"
+
+    def __repr__(self):
+        return "DenseVector([%s])" % ", ".join(_format_float(i) for i in self.array)
+
+    def __eq__(self, other):
+        if isinstance(other, DenseVector):
+            return ivy.array_equal(self.array, other.array)
+        elif isinstance(other, SparseVector):
+            if len(self) != other.size:
+                return False
+            return Vectors._equals(
+                list(range(len(self))), self.array, other.indices, other.values
+            )
+        return False
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        size = len(self)
+        result = 31 + size
+        nnz = 0
+        i = 0
+        while i < size and nnz < 128:
+            if self.array[i] != 0:
+                result = 31 * result + i
+                bits = _double_to_long_bits(self.array[i])
+                result = 31 * result + (bits ^ (bits >> 32))
+                nnz += 1
+            i += 1
+        return result
+
+    def __getattr__(self, item):
+        return getattr(self.array, item)
+
+    def __neg__(self):
+        return DenseVector(-self.array)
+
+    def _delegate(op):
+        def func(self, other):
+            if isinstance(other, DenseVector):
+                other = other.array
+            return DenseVector(getattr(self.array, op)(other))
+
+        return func
+
+    __add__ = _delegate("__add__")
+    __sub__ = _delegate("__sub__")
+    __mul__ = _delegate("__mul__")
+    __div__ = _delegate("__div__")
+    __truediv__ = _delegate("__truediv__")
+    __mod__ = _delegate("__mod__")
+    __radd__ = _delegate("__radd__")
+    __rsub__ = _delegate("__rsub__")
+    __rmul__ = _delegate("__rmul__")
+    __rdiv__ = _delegate("__rdiv__")
+    __rtruediv__ = _delegate("__rtruediv__")
+    __rmod__ = _delegate("__rmod__")
+
+
+class SparseVector(Vector):
+    def __init__(self, size, *args):
+        self.size = int(size)
+        assert 1 <= len(args) <= 2, "must pass either 2 or 3 arguments"
+        if len(args) == 1:
+            pairs = args[0]
+            if type(pairs) == dict:
+                pairs = pairs.items()
+            pairs = cast(Iterable[Tuple[int, float]], sorted(pairs))
+            self.indices = ivy.array([p[0] for p in pairs], dtype=ivy.int32)
+            self.values = ivy.array([p[1] for p in pairs], dtype=ivy.float64)
+        else:
+            if isinstance(args[0], bytes):
+                assert isinstance(args[1], bytes), "Values should be string too"
+                if args[0]:
+                    self.indices = ivy.frombuffer(args[0], dtype=ivy.int32)
+                    self.values = ivy.frombuffer(args[1], dtype=ivy.float64)
+                else:
+                    self.indices = ivy.array([], dtype=ivy.int32)
+                    self.values = ivy.array([], dtype=ivy.float64)
+            else:
+                self.indices = ivy.array(args[0], dtype=ivy.int32)
+                self.values = ivy.array(args[1], dtype=ivy.float64)
+            assert len(self.indices) == len(
+                self.values
+            ), "indices and values arrays must have the same length"
+            for i in range(len(self.indices) - 1):
+                if self.indices[i] >= self.indices[i + 1]:
+                    raise TypeError(
+                        "Indices %s and %s are not strictly increasing"
+                        % (self.indices[i], self.indices[i + 1])
+                    )
+
+        if self.indices.size > 0:
+            assert (
+                ivy.max(self.indices) < self.size
+            ), "Index %d is out of the size of vector with size=%d" % (
+                ivy.max(self.indices),
+                self.size,
+            )
+            assert ivy.min(self.indices) >= 0, "Contains negative index %d" % (
+                ivy.min(self.indices)
+            )
+
+    def numNonzeros(self):
+        return ivy.count_nonzero(self.values)
+
+    def norm(self, p):
+        return ivy_np.linalg.norm(self.values, p)
+
+    def __reduce__(self):
+        return (
+            SparseVector,
+            (self.size, self.indices.tobytes(), self.values.tobytes()),
+        )
+
+    def dot(self, other):
+        if isinstance(other, ivy.Array):
+            if other.ndim not in [2, 1]:
+                raise ValueError(
+                    "Cannot call dot with %d-dimensional array" % other.ndim
+                )
+            assert len(self) == other.shape[0], "dimension mismatch"
+            return ivy.dot(self.values, other[self.indices])
+
+        assert len(self) == _vector_size(other), "dimension mismatch"
+
+        if isinstance(other, DenseVector):
+            return ivy.dot(other.array[self.indices], self.values)
+
+        elif isinstance(other, SparseVector):
+            # TODO: implement ivy.in1d
+            self_cmind = np.in1d(self.indices, other.indices, assume_unique=True)
+            self_values = self.values[self_cmind]
+            if self_values.size == 0:
+                return ivy.float64(0)
+            else:
+                other_cmind = np.in1d(other.indices, self.indices, assume_unique=True)
+                return ivy.dot(self_values, other.values[other_cmind])
+
+        else:
+            return self.dot(_convert_to_vector(other))
+
+
+# --- Helpers --- #
+# --------------- #
+
+
+def _convert_to_vector(l):
+    if isinstance(l, Vector):
+        return l
+    elif type(l) in (array.array, ivy.Array, list, tuple, range):
+        return DenseVector(l)
+    elif _have_scipy and scipy.sparse.issparse(l):
+        assert l.shape[1] == 1, "Expected column vector"
+        csc = l.tocsc()
+        if not csc.has_sorted_indices:
+            csc.sort_indices()
+        return SparseVector(l.shape[0], csc.indices, csc.data)
+    else:
+        raise TypeError("Cannot convert type %s into Vector" % type(l))
+
+
+def _double_to_long_bits(d):
+    if ivy.isnan(value):
+        value = float("nan")
+    return struct.unpack("Q", struct.pack("d", value))[0]
+
+
+def _format_float(f, digits=4):
+    s = str(round(f, digits))
+    if "." in s:
+        s = s[: s.index(".") + 1 + digits]
+    return s
+
+
+def _vector_size(v):
+    if isinstance(v, Vector):
+        return len(v)
+    elif type(v) in (array.array, list, tuple, range):
+        return len(v)
+    elif type(v) == ivy.Array:
+        if v.ndim == 1 or (v.ndim == 2 and v.shape[1] == 1):
+            return len(v)
+        else:
+            raise ValueError(
+                "Cannot treat an array of shape %s as a Vector" % str(v.shape)
+            )
+    elif _have_scipy and scipy.sparse.issparse(v):
+        assert v.shape[1] == 1, "Expected column vector"
+        return v.shape[0]
+    else:
+        raise TypeError("Cannot treat type %s as a Vector" % type(v))
