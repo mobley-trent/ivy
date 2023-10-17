@@ -3,7 +3,6 @@ import struct
 import numpy as np
 import ivy
 import scipy
-import ivy.functional.frontends.numpy as ivy_np
 
 from typing import Iterable, Tuple, cast
 
@@ -56,7 +55,7 @@ class DenseVector(Vector):
         return ivy.count_nonzero(self.array)
 
     def norm(self, p):
-        return ivy_np.linalg.norm(self.array, p)
+        return np.linalg.norm(self.array, p)
 
     def dot(self, other):
         if type(other) == ivy.Array:
@@ -215,7 +214,7 @@ class SparseVector(Vector):
         return ivy.count_nonzero(self.values)
 
     def norm(self, p):
-        return ivy_np.linalg.norm(self.values, p)
+        return np.linalg.norm(self.values, p)
 
     def __reduce__(self):
         return (
@@ -249,6 +248,106 @@ class SparseVector(Vector):
 
         else:
             return self.dot(_convert_to_vector(other))
+
+    def squared_distance(self, other):
+        assert len(self) == _vector_size(other), "dimension mismatch"
+
+        if isinstance(other, DenseVector) or isinstance(other, ivy.Array):
+            if isinstance(other, ivy.Array) and ivy.get_num_dims(other) != 1:
+                raise ValueError(
+                    "Cannot call squared_distance with %d-dimensional array"
+                    % ivy.get_num_dims(other)
+                )
+            if isinstance(other, DenseVector):
+                other = other.array
+            sparse_ind = ivy.zeros(other.size, dtype=ivy.bool)
+            sparse_ind[self.indices] = True
+            dist = other[sparse_ind] - self.values
+            result = ivy.dot(dist, dist)
+
+            other_ind = other[~sparse_ind]
+            result += ivy.dot(other_ind, other_ind)
+            return result
+
+        elif isinstance(other, SparseVector):
+            result = 0.0
+            i, j = 0, 0
+            while i < len(self.indices) and j < len(other.indices):
+                if self.indices[i] == other.indices[j]:
+                    diff = self.values[i] - other.values[j]
+                    result += diff * diff
+                    i += 1
+                    j += 1
+                elif self.indices[i] < other.indices[j]:
+                    result += self.values[i] * self.values[i]
+                    i += 1
+                else:
+                    result += other.values[j] * other.values[j]
+                    j += 1
+            while i < len(self.indices):
+                result += self.values[i] * self.values[i]
+                i += 1
+            while j < len(other.indices):
+                result += other.values[j] * other.values[j]
+                j += 1
+            return result
+        else:
+            return self.squared_distance(_convert_to_vector(other))
+
+    def toArray(self):
+        arr = ivy.zeros((self.size,), dtype=ivy.float64)
+        arr[self.indices] = self.values
+        return arr
+
+    def asML(self):
+        return SparseVector(self.size, self.indices, self.values)
+
+    def __len__(self):
+        return self.size
+
+    def __str__(self):
+        inds = "[" + ",".join([str(i) for i in self.indices]) + "]"
+        vals = "[" + ",".join([str(v) for v in self.values]) + "]"
+        return "(" + ",".join((str(self.size), inds, vals)) + ")"
+
+    def __repr__(self):
+        inds = self.indices
+        vals = self.values
+        entries = ", ".join(
+            [
+                "{0}: {1}".format(inds[i], _format_float(vals[i]))
+                for i in range(len(inds))
+            ]
+        )
+        return "SparseVector({0}, {{{1}}})".format(self.size, entries)
+
+    def __eq__(self, other):
+        if isinstance(other, SparseVector):
+            return (
+                other.size == self.size
+                and ivy.array_equal(other.indices, self.indices)
+                and ivy.array_equal(other.values, self.values)
+            )
+        elif isinstance(other, DenseVector):
+            if self.size != len(other):
+                return False
+            return Vectors._equals(
+                self.indices, self.values, list(range(len(other))), other.array
+            )
+        return False
+
+    def __getitem__(self, index):
+        self.indices
+        self.values
+        if not isinstance(index, int):
+            raise TypeError(
+                "Indices must be of type integer, got type %s" % type(index)
+            )
+
+        if index >= self.size or index < -self.size:
+            raise IndexError("Index %d out of bounds." % index)
+        if index < 0:
+            index += self.size
 
 
 # --- Helpers --- #
